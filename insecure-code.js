@@ -1,67 +1,104 @@
 const express = require('express');
-const mysql = require('mysql');
-const fs = require('fs');
 const app = express();
-
 app.use(express.json());
 
-// Hardcoded credentials
-const db = mysql.createConnection({
-  host: 'localhost',
-  user: 'root',
-  password: 'admin123',
-  database: 'users'
+// Simulated user database
+const users = [
+  {
+    id: 1,
+    username: 'alice',
+    email: 'alice@example.com',
+    passwordHash: '$2b$10$abcd1234...',
+    ssn: '123-45-6789',
+    creditCard: '4532-1488-0343-6467',
+    apiKey: 'sk_live_8f7d6a5b4c3e2f1a',
+    role: 'user'
+  },
+  {
+    id: 2,
+    username: 'bob',
+    email: 'bob@example.com',
+    passwordHash: '$2b$10$wxyz9876...',
+    ssn: '987-65-4321',
+    creditCard: '5500-0000-0000-0004',
+    apiKey: 'sk_live_1a2b3c4d5e6f7g8h',
+    role: 'admin'
+  }
+];
+
+// VULNERABILITY 1: Returns full user object including secrets
+app.get('/api/users/:id', (req, res) => {
+  const user = users.find(u => u.id === parseInt(req.params.id));
+  if (!user) return res.status(404).send('Not found');
+  res.json(user); // Leaks passwordHash, ssn, creditCard, apiKey
 });
 
-// 1. SQL Injection vulnerability
-app.get('/user', (req, res) => {
-  const query = `SELECT * FROM users WHERE username = '${req.query.username}'`;
-  db.query(query, (err, results) => {
-    res.json(results);
-  });
+// VULNERABILITY 2: Lists ALL users with sensitive fields to anyone
+app.get('/api/users', (req, res) => {
+  res.json(users);
 });
 
-// 2. Path Traversal vulnerability
-app.get('/file', (req, res) => {
-  const filename = req.query.name;
-  fs.readFile('./uploads/' + filename, 'utf8', (err, data) => {
-    res.send(data);
-  });
-});
-
-// 3. Cross-Site Scripting (XSS)
-app.get('/greet', (req, res) => {
-  res.send(`<h1>Hello, ${req.query.name}!</h1>`);
-});
-
-// 4. Command Injection
-app.get('/ping', (req, res) => {
-  const { exec } = require('child_process');
-  exec(`ping -c 1 ${req.query.host}`, (err, stdout) => {
-    res.send(stdout);
-  });
-});
-
-// 5. Insecure authentication — plaintext password comparison, no rate limiting
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  db.query(`SELECT * FROM users WHERE username='${username}' AND password='${password}'`,
-    (err, results) => {
-      if (results.length > 0) {
-        res.cookie('session', username); // No httpOnly, no secure, no signing
-        res.send('Logged in');
-      } else {
-        res.send('Invalid credentials');
-      }
+// VULNERABILITY 3: Verbose error messages leak internal details
+app.get('/api/account', (req, res) => {
+  try {
+    const userId = req.query.id;
+    const user = users.find(u => u.id === parseInt(userId));
+    if (!user) {
+      // Leaks the database query path and internal structure
+      throw new Error(
+        `User lookup failed in /var/app/db/users.json at line 42. ` +
+        `Connection: mysql://admin:Pa$$w0rd@10.0.0.5:3306/prod_db`
+      );
+    }
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+      stack: err.stack,           // Full stack trace exposed
+      env: process.env            // ALL environment variables (API keys, DB creds!)
     });
+  }
 });
 
-// 6. Exposing stack traces and verbose errors
-app.use((err, req, res, next) => {
-  res.status(500).send(err.stack);
+// VULNERABILITY 4: Debug endpoint left in production
+app.get('/debug/config', (req, res) => {
+  res.json({
+    dbPassword: process.env.DB_PASSWORD,
+    jwtSecret: process.env.JWT_SECRET,
+    stripeKey: process.env.STRIPE_SECRET_KEY,
+    awsAccessKey: process.env.AWS_ACCESS_KEY_ID,
+    awsSecretKey: process.env.AWS_SECRET_ACCESS_KEY
+  });
 });
 
-// 7. No HTTPS, no helmet, no CORS config, listening on all interfaces
-app.listen(3000, '0.0.0.0', () => {
-  console.log('Server running on port 3000');
+// VULNERABILITY 5: Username enumeration via different responses
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  const user = users.find(u => u.username === username);
+  if (!user) {
+    return res.status(404).json({ error: 'Username does not exist' });
+  }
+  if (user.passwordHash !== hashPassword(password)) {
+    return res.status(401).json({ error: 'Wrong password for this user' });
+  }
+  res.json({ token: 'abc123' });
 });
+
+// VULNERABILITY 6: Server header and version disclosure
+app.use((req, res, next) => {
+  res.setHeader('X-Powered-By', 'Express 4.17.1');
+  res.setHeader('X-Server', 'Node.js v14.15.0 on Ubuntu 18.04');
+  res.setHeader('X-Database', 'MySQL 5.7.32');
+  next();
+});
+
+// VULNERABILITY 7: Logs sensitive data
+app.post('/api/payment', (req, res) => {
+  console.log('Payment received:', JSON.stringify(req.body));
+  // Logs full credit card number, CVV, etc. to stdout/log files
+  res.json({ status: 'processed' });
+});
+
+function hashPassword(p) { return p; } // pretend hash
+
+app.listen(3000);
